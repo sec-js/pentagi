@@ -278,7 +278,7 @@ func (s *UserService) GetUsers(c *gin.Context) {
 // @Produce json
 // @Param hash path string true "hash in hex format (md5)" minlength(32) maxlength(32)
 // @Success 200 {object} response.successResp{data=models.UserRolePrivileges} "user received successful"
-// @Failure 403 {object} response.errorResp "getting user not permitted
+// @Failure 403 {object} response.errorResp "getting user not permitted"
 // @Failure 404 {object} response.errorResp "user not found"
 // @Failure 500 {object} response.errorResp "internal error on getting user"
 // @Router /users/{hash} [get]
@@ -404,8 +404,30 @@ func (s *UserService) CreateUser(c *gin.Context) {
 		user.Password = string(encPassword)
 	}
 
-	if err = s.db.Create(&user).Error; err != nil {
+	tx := s.db.Begin()
+	if tx.Error != nil {
+		logger.FromContext(c).WithError(tx.Error).Errorf("error starting transaction")
+		response.Error(c, response.ErrInternal, tx.Error)
+		return
+	}
+
+	if err = tx.Create(&user).Error; err != nil {
+		tx.Rollback()
 		logger.FromContext(c).WithError(err).Errorf("error creating user")
+		response.Error(c, response.ErrInternal, err)
+		return
+	}
+
+	preferences := models.NewUserPreferences(user.ID)
+	if err = tx.Create(preferences).Error; err != nil {
+		tx.Rollback()
+		logger.FromContext(c).WithError(err).Errorf("error creating user preferences")
+		response.Error(c, response.ErrInternal, err)
+		return
+	}
+
+	if err = tx.Commit().Error; err != nil {
+		logger.FromContext(c).WithError(err).Errorf("error committing transaction")
 		response.Error(c, response.ErrInternal, err)
 		return
 	}

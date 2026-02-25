@@ -44,7 +44,7 @@ func (p *flowPublisher) FlowDeleted(ctx context.Context, flow database.Flow, ter
 
 func (p *flowPublisher) FlowUpdated(ctx context.Context, flow database.Flow, terms []database.Container) {
 	flowModel := converter.ConvertFlow(flow, terms)
-	p.ctrl.flowUpdated.Publish(ctx, p.flowID, flowModel)
+	p.ctrl.flowUpdated.Publish(ctx, p.userID, flowModel)
 	p.ctrl.flowUpdatedAdmin.Broadcast(ctx, flowModel)
 }
 
@@ -126,4 +126,8 @@ func (p *flowPublisher) APITokenUpdated(ctx context.Context, apiToken database.A
 
 func (p *flowPublisher) APITokenDeleted(ctx context.Context, apiToken database.ApiToken) {
 	p.ctrl.apiTokenDeleted.Publish(ctx, p.userID, converter.ConvertAPIToken(apiToken))
+}
+
+func (p *flowPublisher) SettingsUserUpdated(ctx context.Context, userPreferences database.UserPreference) {
+	p.ctrl.settingsUserUpdated.Publish(ctx, p.userID, converter.ConvertUserPreferences(userPreferences))
 }

@@ -288,9 +288,16 @@ func (s *AuthService) AuthAuthorize(c *gin.Context) {
 	signedStateJSON := append(signature, stateJSON...)
 	state := base64.RawURLEncoding.EncodeToString(signedStateJSON)
 
+	// Google OAuth uses POST callback which requires SameSite=None for cross-site requests
+	// GitHub and other providers use GET callback which works with SameSite=Lax
+	sameSiteMode := http.SameSiteLaxMode
+	if provider == "google" {
+		sameSiteMode = http.SameSiteNoneMode
+	}
+
 	maxAge := int(authStateRequestTTL / time.Second)
-	s.setCallbackCookie(c.Writer, c.Request, authStateCookieName, state, maxAge)
-	s.setCallbackCookie(c.Writer, c.Request, authNonceCookieName, nonce, maxAge)
+	s.setCallbackCookie(c.Writer, c.Request, authStateCookieName, state, maxAge, sameSiteMode)
+	s.setCallbackCookie(c.Writer, c.Request, authNonceCookieName, nonce, maxAge, sameSiteMode)
 
 	authOpts := []oauth2.AuthCodeOption{
 		oauth2.SetAuthURLParam("nonce", nonce),
@@ -302,7 +309,7 @@ func (s *AuthService) AuthAuthorize(c *gin.Context) {
 		http.StatusTemporaryRedirect)
 }
 
-// AuthLoginGetCallback is function to catch login callback from OAuth applacation with code only
+// AuthLoginGetCallback is function to catch login callback from OAuth application with code only
 // @Summary Login user from external OAuth application
 // @Tags Public
 // @Accept json
@@ -328,7 +335,14 @@ func (s *AuthService) AuthLoginGetCallback(c *gin.Context) {
 		return
 	}
 
-	if queryState := c.Query("state"); queryState != "" && queryState != state.Value {
+	queryState := c.Query("state")
+	if queryState == "" {
+		logger.FromContext(c).Errorf("error missing state parameter in OAuth callback")
+		response.Error(c, response.ErrAuthInvalidAuthorizationState, fmt.Errorf("state parameter is required"))
+		return
+	}
+
+	if queryState != state.Value {
 		logger.FromContext(c).Errorf("error matching received state to stored one")
 		response.Error(c, response.ErrAuthInvalidAuthorizationState, nil)
 		return
@@ -342,7 +356,7 @@ func (s *AuthService) AuthLoginGetCallback(c *gin.Context) {
 	s.authLoginCallback(c, stateData, code)
 }
 
-// AuthLoginPostCallback is function to catch login callback from OAuth applacation
+// AuthLoginPostCallback is function to catch login callback from OAuth application
 // @Summary Login user from external OAuth application
 // @Tags Public
 // @Accept json
@@ -390,7 +404,7 @@ func (s *AuthService) AuthLoginPostCallback(c *gin.Context) {
 	s.authLoginCallback(c, stateData, data.Code)
 }
 
-// AuthLogoutCallback is function to catch logout callback from OAuth applacation
+// AuthLogoutCallback is function to catch logout callback from OAuth application
 // @Summary Logout current user from external OAuth application
 // @Tags Public
 // @Accept json
@@ -517,8 +531,31 @@ func (s *AuthService) authLoginCallback(c *gin.Context, stateData map[string]str
 				Status: "active",
 				Type:   models.UserTypeOAuth,
 			}
-			if err = s.db.Create(&user).Error; err != nil {
+
+			tx := s.db.Begin()
+			if tx.Error != nil {
+				logger.FromContext(c).WithError(tx.Error).Errorf("error starting transaction")
+				response.Error(c, response.ErrInternal, tx.Error)
+				return
+			}
+
+			if err = tx.Create(&user).Error; err != nil {
+				tx.Rollback()
 				logger.FromContext(c).WithError(err).Errorf("error creating user")
+				response.Error(c, response.ErrInternal, err)
+				return
+			}
+
+			preferences := models.NewUserPreferences(user.ID)
+			if err = tx.Create(preferences).Error; err != nil {
+				tx.Rollback()
+				logger.FromContext(c).WithError(err).Errorf("error creating user preferences")
+				response.Error(c, response.ErrInternal, err)
+				return
+			}
+
+			if err = tx.Commit().Error; err != nil {
+				logger.FromContext(c).WithError(err).Errorf("error committing transaction")
 				response.Error(c, response.ErrInternal, err)
 				return
 			}
@@ -566,8 +603,14 @@ func (s *AuthService) authLoginCallback(c *gin.Context, stateData map[string]str
 	}
 
 	// delete temporary cookies
-	s.setCallbackCookie(c.Writer, c.Request, authStateCookieName, "", 0)
-	s.setCallbackCookie(c.Writer, c.Request, authNonceCookieName, "", 0)
+	// Google OAuth uses POST callback which requires SameSite=None for cross-site requests
+	// GitHub and other providers use GET callback which works with SameSite=Lax
+	sameSiteMode := http.SameSiteLaxMode
+	if stateData["provider"] == "google" {
+		sameSiteMode = http.SameSiteNoneMode
+	}
+	s.setCallbackCookie(c.Writer, c.Request, authStateCookieName, "", 0, sameSiteMode)
+	s.setCallbackCookie(c.Writer, c.Request, authNonceCookieName, "", 0, sameSiteMode)
 
 	logger.FromContext(c).
 		WithFields(logrus.Fields{
@@ -588,6 +631,7 @@ func (s *AuthService) authLoginCallback(c *gin.Context, stateData map[string]str
 		u, err := url.Parse(returnURI)
 		if err != nil {
 			response.Success(c, http.StatusOK, nil)
+			return
 		}
 		query := u.Query()
 		query.Add("status", "success")
@@ -633,7 +677,22 @@ func (s *AuthService) parseState(c *gin.Context, state string) (map[string]strin
 		return nil, err
 	}
 
-	exp, err := strconv.ParseInt(stateData["exp"], 10, 64)
+	expStr, ok := stateData["exp"]
+	if !ok || expStr == "" {
+		err := fmt.Errorf("missing required field: exp")
+		logger.FromContext(c).WithError(err).Errorf("error on validating state data")
+		response.Error(c, response.ErrAuthInvalidAuthorizationState, err)
+		return nil, err
+	}
+
+	if _, ok := stateData["provider"]; !ok {
+		err := fmt.Errorf("missing required field: provider")
+		logger.FromContext(c).WithError(err).Errorf("error on validating state data")
+		response.Error(c, response.ErrAuthInvalidAuthorizationState, err)
+		return nil, err
+	}
+
+	exp, err := strconv.ParseInt(expStr, 10, 64)
 	if err != nil {
 		logger.FromContext(c).WithError(err).Errorf("error on parsing expiration time")
 		response.Error(c, response.ErrAuthInvalidAuthorizationState, err)
@@ -650,13 +709,20 @@ func (s *AuthService) parseState(c *gin.Context, state string) (map[string]strin
 	return stateData, nil
 }
 
-func (s *AuthService) setCallbackCookie(w http.ResponseWriter, r *http.Request, name, value string, maxAge int) {
+func (s *AuthService) setCallbackCookie(
+	w http.ResponseWriter, r *http.Request,
+	name, value string, maxAge int,
+	sameSite http.SameSite,
+) {
+	// Check both direct TLS and X-Forwarded-Proto header (for reverse proxy setups)
+	useTLS := r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
+
 	c := &http.Cookie{
 		Name:     name,
 		Value:    value,
 		HttpOnly: true,
-		Secure:   r.TLS != nil,
-		SameSite: http.SameSiteLaxMode,
+		Secure:   useTLS,
+		SameSite: sameSite,
 		Path:     path.Join(s.cfg.BaseURL, s.cfg.LoginCallbackURL),
 		MaxAge:   maxAge,
 	}
@@ -783,6 +849,7 @@ func (s *AuthService) Info(c *gin.Context) {
 		privs = slices.DeleteFunc(privs, func(priv string) bool {
 			return strings.HasPrefix(priv, "users.") ||
 				strings.HasPrefix(priv, "roles.") ||
+				strings.HasPrefix(priv, "settings.user.") ||
 				strings.HasPrefix(priv, "settings.tokens.")
 		})
 		resp.Privs = privs

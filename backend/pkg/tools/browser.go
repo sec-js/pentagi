@@ -97,10 +97,10 @@ func (b *browser) wrapCommandResult(ctx context.Context, name, result, url, scre
 
 func (b *browser) Handle(ctx context.Context, name string, args json.RawMessage) (string, error) {
 	var action Browser
-	logger := logrus.WithContext(ctx).WithFields(logrus.Fields{
+	logger := logrus.WithContext(ctx).WithFields(enrichLogrusFields(b.flowID, b.taskID, b.subtaskID, logrus.Fields{
 		"tool": name,
 		"args": string(args),
-	})
+	}))
 
 	if name != "browser" {
 		logger.Error("unknown tool")
@@ -431,10 +431,12 @@ func (b *browser) callScraper(url string) ([]byte, error) {
 	resp, err := client.Get(url)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch data by scraper '%s': %w", url, err)
-	} else if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected resp code for scraper '%s': %d", url, resp.StatusCode)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected resp code for scraper '%s': %d", url, resp.StatusCode)
+	}
 
 	content, err := io.ReadAll(resp.Body)
 	if err != nil {

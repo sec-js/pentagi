@@ -13,6 +13,7 @@ import (
 	"pentagi/pkg/schema"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/sirupsen/logrus"
 	"github.com/vxcontrol/langchaingo/llms"
 	"github.com/vxcontrol/langchaingo/vectorstores/pgvector"
 )
@@ -69,12 +70,9 @@ type ScreenshotProvider interface {
 type AgentLogProvider interface {
 	PutLog(
 		ctx context.Context,
-		initiator database.MsgchainType,
-		executor database.MsgchainType,
-		task string,
-		result string,
-		taskID *int64,
-		subtaskID *int64,
+		initiator, executor database.MsgchainType,
+		task, result string,
+		taskID, subtaskID *int64,
 	) (int64, error)
 }
 
@@ -675,6 +673,19 @@ func (fte *flowToolsExecutor) GetAssistantExecutor(cfg AssistantExecutorConfig) 
 			definitions = append(definitions, registryDefinitions[SearxngToolName])
 			handlers[SearxngToolName] = searxng.Handle
 		}
+
+		sploitus := NewSploitusTool(
+			fte.flowID,
+			nil, // taskID
+			nil, // subtaskID
+			fte.cfg.SploitusEnabled,
+			fte.cfg.ProxyURL,
+			fte.slp,
+		)
+		if sploitus.IsAvailable() {
+			definitions = append(definitions, registryDefinitions[SploitusToolName])
+			handlers[SploitusToolName] = sploitus.Handle
+		}
 	}
 
 	ce := &customExecutor{
@@ -1059,6 +1070,19 @@ func (fte *flowToolsExecutor) GetPentesterExecutor(cfg PentesterExecutorConfig) 
 		ce.handlers[GraphitiSearchToolName] = graphitiSearch.Handle
 	}
 
+	sploitus := NewSploitusTool(
+		fte.flowID,
+		cfg.TaskID,
+		cfg.SubtaskID,
+		fte.cfg.SploitusEnabled,
+		fte.cfg.ProxyURL,
+		fte.slp,
+	)
+	if sploitus.IsAvailable() {
+		ce.definitions = append(ce.definitions, registryDefinitions[SploitusToolName])
+		ce.handlers[SploitusToolName] = sploitus.Handle
+	}
+
 	return ce, nil
 }
 
@@ -1199,6 +1223,19 @@ func (fte *flowToolsExecutor) GetSearcherExecutor(cfg SearcherExecutorConfig) (C
 	if searxng.IsAvailable() {
 		ce.definitions = append(ce.definitions, registryDefinitions[SearxngToolName])
 		ce.handlers[SearxngToolName] = searxng.Handle
+	}
+
+	sploitus := NewSploitusTool(
+		fte.flowID,
+		cfg.TaskID,
+		cfg.SubtaskID,
+		fte.cfg.SploitusEnabled,
+		fte.cfg.ProxyURL,
+		fte.slp,
+	)
+	if sploitus.IsAvailable() {
+		ce.definitions = append(ce.definitions, registryDefinitions[SploitusToolName])
+		ce.handlers[SploitusToolName] = sploitus.Handle
 	}
 
 	search := &search{
@@ -1464,4 +1501,20 @@ func (fte *flowToolsExecutor) GetReporterExecutor(cfg ReporterExecutorConfig) (C
 		handlers:    map[string]ExecutorHandler{ReportResultToolName: cfg.ReportResult},
 		barriers:    map[string]struct{}{ReportResultToolName: {}},
 	}, nil
+}
+
+func enrichLogrusFields(flowID int64, taskID, subtaskID *int64, fields logrus.Fields) logrus.Fields {
+	if fields == nil {
+		fields = make(logrus.Fields)
+	}
+
+	fields["flow_id"] = flowID
+	if taskID != nil {
+		fields["task_id"] = *taskID
+	}
+	if subtaskID != nil {
+		fields["subtask_id"] = *subtaskID
+	}
+
+	return fields
 }
